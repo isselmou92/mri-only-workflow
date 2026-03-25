@@ -76,7 +76,7 @@
     ssim_kernel: 7
     ssim_sigma: 1.5
 
-    nmi_weight: 0.0               # disabled -- NMI is expensive and fragile with HU data
+    nmi_weight: 1.5               
     nmi_bins: 64
     nmi_value_min: -1000.0
     nmi_value_max:  7000.0
