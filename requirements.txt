@@ -1,0 +1,10 @@
+torch
+numpy
+nibabel
+pydicom
+pyyaml
+simpleitk
+scipy
+pillow
+matplotlib
+tensorboard

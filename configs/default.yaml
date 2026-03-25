@@ -1,0 +1,107 @@
+  # configs/default.yaml
+  # Minimal, explainable 3D sCT config (whole-volume training)
+  # Volumes: 128 x 128 x 112 (D x H x W), MRI -> CT (HU)
+  # Directory-based pairing (no CSV): we match MRI and CT files by filename stem.
+
+  experiment_name: "simple_sct_explainable"
+  seed: 1337
+
+  data:
+    # --- Directories containing resampled NIfTI volumes ---
+    mri_dir: "data/MR"
+    ct_dir: "data/CT"
+
+    # Glob patterns (recursive by default)
+    mri_glob: "**/*.nii*"
+    ct_glob: "**/*.nii*"
+
+    # How to pair MRI with CT:
+    pairing:
+      mode: "sorted"                  # "stem" (match by filename stem) | "sorted" (fallback: sort both lists)
+      case_insensitive: true
+      # Optional suffixes to strip from stems before matching
+      mri_strip_suffixes: [ "_MR", "_MRI" ]
+      ct_strip_suffixes: [ "_CT", "_sCT", "_CTHU" ]
+
+    enforce_shape: [ 128, 128, 112 ]    # (D,H,W) - all data must match this
+    reorient_to_canonical: false
+
+    # Scaling: keep targets in HU for interpretable metrics (MAE/RMSE in HU)
+    scale_input: "zscore"           # "zscore" | "minmax" | "none"
+    scale_target: "hu"              # "hu" | "minmax"
+    hu_min: -1000.0
+    hu_max: 7000.0
+
+    num_workers: 8
+    prefetch_factor: 4
+    pin_memory: true
+
+  train:
+    epochs: 500
+    batch_size: 2
+    lr: 1.5e-4
+    weight_decay: 0.0
+    amp: true                       # mixed precision
+    grad_clip: 1.0
+    grad_accum_steps: 1
+    ema: true
+    device_preference: "cuda"       # "cuda" | "cpu" | "auto"
+
+    xai_cmap: "redblue"
+
+    # ---- XAI during training (computed on the current batch) ----
+    xai_enabled: true
+    xai_log_every_steps: 200
+    xai_methods: [ "saliency" ]       # ["saliency"] or ["saliency","occlusion"]
+    xai_occlusion:
+      patch: [ 9, 9, 9 ]
+      stride: [ 8, 8, 8 ]
+    xai_log_norm: true
+    xai_log_axes: [ "axial", "sagittal", "coronal" ]
+    xai_slice_indices:
+      axial: [ 64 ]
+      sagittal: [ 64 ]
+      coronal: [ 56 ]
+
+  model:
+    in_channels: 1
+    out_channels: 1
+    base_filters: 128
+    depth: 3
+    final_act: "identity"           # "identity" | "tanh"
+
+  loss:
+    l1_weight: 2.0
+    ssim_weight: 0.5               # structural similarity for edge preservation
+    ssim_kernel: 7
+    ssim_sigma: 1.5
+
+    nmi_weight: 0.0               # disabled -- NMI is expensive and fragile with HU data
+    nmi_bins: 64
+    nmi_value_min: -1000.0
+    nmi_value_max:  7000.0
+    nmi_sigma: 62.5
+
+  metrics:
+    compute_psnr: true
+    compute_ssim: true
+
+  logging:
+    log_interval: 10
+    tensorboard: true
+    checkpoint_every: 20            # epochs
+    save_best_on: "val_mae"         # minimize
+    out_dir: "output"
+    log_dir: "runs"
+    ckpt_dir: "checkpoints"
+
+    tb_images_every_steps: 100
+    tb_render_axes: [ "axial", "sagittal", "coronal" ]
+    tb_slice_indices:
+      axial: [ 64 ]
+      sagittal: [ 64 ]
+      coronal: [ 56 ]
+    tb_num_examples: 1
+
+  eval:
+    out_csv: "eval_metrics.csv"
