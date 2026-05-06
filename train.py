@@ -20,13 +20,16 @@ from simple_sct.utils.logging import (
     log_triplet_panels,
     log_xai_maps,
 )
-from simple_sct.data.volume_dataset import VolumePairs
+from simple_sct.data.volume_dataset import VolumePairs, unnormalize
 from simple_sct.models.simple_unet3d import UNet3D
 # >>> changed here: use your new ReconstructionLoss
 from simple_sct.losses.basic import ReconstructionLoss
 from simple_sct.metrics.metrics import compute_all
 from simple_sct.xai.attribution import gradient_saliency, occlusion_sensitivity
+import numpy as np
 
+np.random.seed(1337)
+torch.manual_seed(1337)
 
 # -----------------------------
 # EMA (optional)
@@ -68,7 +71,7 @@ class EMA:
 # -----------------------------
 # Train/Val/Test Split by Mouse ID and Timepoint
 # -----------------------------
-def split_by_mouse_timepoint(ds: VolumePairs, seed: int = 1337) -> tuple[list[int], list[int], list[int]]:
+def split_by_mouse_timepoint(ds: VolumePairs, fold:int, seed: int = 1337) -> tuple[list[int], list[int], list[int]]:
     """
     Split dataset into train/val/test.
     
@@ -80,46 +83,15 @@ def split_by_mouse_timepoint(ds: VolumePairs, seed: int = 1337) -> tuple[list[in
     """
     import random
     
-    val_patterns = [
-        ("66", ["T1", "T2"]),
-        ("30", ["T1", "T2", "T3"]),
-    ]
-    
-    val_indices = []
-    remaining_indices = []
-    
-    for idx, pair in enumerate(ds.pairs):
-        # Use the actual MRI filename for matching (not pair_keys which may be indices)
-        filename = pair.mri.stem.upper()  # e.g., "MZEI00066_MR_HEAD_REGISTERED_T1"
-        
-        is_val = False
-        
-        # Check val patterns
-        for mouse_id, timepoints in val_patterns:
-            # Match mouse ID (handles both MZEI00066 and MZEI0066 formats)
-            if f"MZEI000{mouse_id}" in filename or f"MZEI00{mouse_id}" in filename:
-                for tp in timepoints:
-                    # Match timepoint at end of filename (e.g., _T1, _T2)
-                    if filename.endswith(f"_{tp}") or filename.endswith(tp):
-                        is_val = True
-                        break
-            if is_val:
-                break
-        
-        if is_val:
-            val_indices.append(idx)
-        else:
-            remaining_indices.append(idx)
+    cases_per_fold = (len(ds.files) // 3)
     
     # Split remaining indices 80/20 into train/test
-    rng = random.Random(seed)
-    rng.shuffle(remaining_indices)
-    
-    n_remaining = len(remaining_indices)
-    n_train = int(0.8 * n_remaining)
-    
-    train_indices = remaining_indices[:n_train]
-    test_indices = remaining_indices[n_train:]
+    all_indices = list(range(len(ds)))
+    random_indicies = np.random.choice(all_indices, size=len(ds), replace=False)
+    all_indices = list(random_indicies)
+    val_indices = all_indices[cases_per_fold * fold : cases_per_fold * (fold + 1)]
+    train_indices = list(set(all_indices).difference(set(val_indices)))
+    test_indices = None
     
     return train_indices, val_indices, test_indices
 
@@ -129,8 +101,10 @@ def split_by_mouse_timepoint(ds: VolumePairs, seed: int = 1337) -> tuple[list[in
 # -----------------------------
 def parse_args():
     ap = argparse.ArgumentParser(description="Train minimal, explainable 3D sCT model with TensorBoard + live XAI")
-    ap.add_argument("--config", required=True, help="Path to YAML config (e.g., configs/default.yaml)")
-    ap.add_argument("--device", default=None, help='Override device ("cuda","cpu","auto"); else use config preference')
+    ap.add_argument("--config", default='configs/default.yaml', help="Path to YAML config (e.g., configs/default.yaml)")#required=True,
+    ap.add_argument("--device", default="cuda", help='Override device ("cuda","cpu","auto"); else use config preference')
+    ap.add_argument("--fold", type=int, default=0, help="Fold number for cross-validation") 
+    ap.add_argument("--continue_from_checkpoint", default="./configs/output/checkpoints/epoch_0360.pt", help="Path to .pt checkpoint to resume training")
     return ap.parse_args()
 
 
@@ -142,9 +116,10 @@ def run_validation(
     model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
+    cfg: Any,
     include_psnr: bool,
     include_ssim: bool,
-    data_range: float = 8000.0,
+    data_range: float = 4000.0
 ) -> Dict[str, float]:
     model.eval()
     agg = {"mae": 0.0, "rmse": 0.0}
@@ -158,14 +133,15 @@ def run_validation(
         x = batch["mri"].to(device)
         y = batch["ct"].to(device)
         pred = model(x)
-        m = compute_all(pred, y, include_psnr, include_ssim, data_range=data_range)
+        m = compute_all(unnormalize(pred, cfg.data.hu_min, cfg.data.hu_max), unnormalize(y, cfg.data.hu_min, cfg.data.hu_max), include_psnr, include_ssim, data_range=data_range)
         for k, v in m.items():
             agg[k] += float(v)
         n += 1
 
     for k in list(agg.keys()):
         agg[k] /= max(1, n)
-    return agg
+
+    return agg, (x,y,pred)
 
 
 # -----------------------------
@@ -186,13 +162,12 @@ def main():
 
     # Data - split by mouse ID and timepoint
     ds = VolumePairs(cfg)
-    train_indices, val_indices, test_indices = split_by_mouse_timepoint(ds, seed=cfg.seed)
+    train_indices, val_indices, test_indices = split_by_mouse_timepoint(ds, fold=cfg.data.fold, seed=cfg.seed)
     
     train_ds = torch.utils.data.Subset(ds, train_indices)
     val_ds = torch.utils.data.Subset(ds, val_indices)
-    test_ds = torch.utils.data.Subset(ds, test_indices)
     
-    n_train, n_val, n_test = len(train_ds), len(val_ds), len(test_ds)
+    n_train, n_val, n_test = len(train_ds), len(val_ds), len(val_ds)
 
     train_loader = DataLoader(
         train_ds,
@@ -210,27 +185,37 @@ def main():
         num_workers=0,
         pin_memory=True,
     )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-    )
+    test_loader = val_loader
 
     # Model, loss, optimizer, scaler, EMA
     model = UNet3D(**cfg.model.__dict__).to(device)
+    if args.continue_from_checkpoint:
+        ckpt = torch.load(args.continue_from_checkpoint, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        logger.info(f"Resumed model weights from checkpoint: {args.continue_from_checkpoint}")
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+        # Cosine-annealing LR schedule (decays to ~0 over all epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=cfg.train.epochs, eta_min=1e-6,
+    )
+    if args.continue_from_checkpoint:
+        if "optimizer" in ckpt:
+            opt.load_state_dict(ckpt["optimizer"])
+            logger.info(f"Resumed optimizer state from checkpoint: {args.continue_from_checkpoint}")
+        else:
+            logger.warning(f"No optimizer state found in checkpoint: {args.continue_from_checkpoint}")
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+            logger.info(f"Resumed scheduler state from checkpoint: {args.continue_from_checkpoint}")
+        else:
+            logger.warning(f"No scheduler state found in checkpoint: {args.continue_from_checkpoint}")
 
     # --- GradScaler with conservative initial scale ---
     # Default 2^16=65536 × loss~1330 ≈ 87M → fp16 gradient overflow.
     # Start at 2^10=1024 and let it grow automatically.
     scaler = GradScaler(device="cuda", enabled=bool(cfg.train.amp), init_scale=2**10)
 
-    # Cosine-annealing LR schedule (decays to ~0 over all epochs)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=cfg.train.epochs, eta_min=1e-6,
-    )
+
 
     # >>> build ReconstructionLoss fully from YAML (no hardcoding)
     # Compute the SSIM data range from the target scaling:
@@ -239,7 +224,7 @@ def main():
     if cfg.data.scale_target == "hu":
         ssim_dr = float(cfg.data.hu_max) - float(cfg.data.hu_min)
     else:
-        ssim_dr = 2.0
+        ssim_dr = float(cfg.data.hu_max) - float(cfg.data.hu_min)#2.0
 
     loss_fn = ReconstructionLoss(
         l1_weight=cfg.loss.l1_weight,
@@ -265,17 +250,17 @@ def main():
         f"Start training | epochs={cfg.train.epochs} | train={n_train} | val={n_val} | test={n_test} | "
         f"device={device} | amp={cfg.train.amp}"
     )
-    logger.info(f"Val samples: {[ds.pairs[i].mri.stem for i in val_indices]}")
-    logger.info(f"Test samples: {[ds.pairs[i].mri.stem for i in test_indices]}")
+    logger.info(f"Val samples: {[ds.files[i].stem for i in val_indices]}")
+    logger.info(f"Test samples: {[ds.files[i].stem for i in val_indices]}")
 
     # --- XAI colormap (new): user wanted hot/cold
     xai_cmap = getattr(cfg.train, "xai_cmap", "hot")  # typical diverging map
 
     # Helper closures for TB logging
-    def _maybe_log_triplets(step: int, x: torch.Tensor, pred: torch.Tensor, y: torch.Tensor):
+    def _maybe_log_triplets(step: int, x: torch.Tensor, pred: torch.Tensor, y: torch.Tensor, model:str="train"):
         if writer is None or cfg.logging.tb_images_every_steps <= 0:
             return
-        if step % cfg.logging.tb_images_every_steps != 0:
+        if model == 'train' and step % cfg.logging.tb_images_every_steps != 0:
             return
         # Only log first example in batch to keep TB light
         x0 = x[:1].detach().cpu()
@@ -283,7 +268,7 @@ def main():
         y0 = y[:1].detach().cpu()
         log_triplet_panels(
             writer=writer,
-            tag_prefix="train/volumes",
+            tag_prefix=f"{model}/volumes",
             mri=x0,
             pred=p0,
             ct=y0,
@@ -341,7 +326,7 @@ def main():
             )
 
     # ---------------- Train epochs ----------------
-    for epoch in range(1, cfg.train.epochs + 1):
+    for epoch in range(1 if not args.continue_from_checkpoint else ckpt["epoch"] + 1, cfg.train.epochs + 1):
         model.train()
         t0 = time.time()
         running = 0.0
@@ -401,7 +386,8 @@ def main():
                 if writer is not None:
                     with torch.no_grad():
                         m = compute_all(
-                            pred_f32, y_f32,
+                            unnormalize(pred_f32, cfg.data.hu_min, cfg.data.hu_max),
+                            unnormalize(y_f32, cfg.data.hu_min, cfg.data.hu_max),
                             include_psnr=cfg.metrics.compute_psnr,
                             include_ssim=cfg.metrics.compute_ssim,
                             data_range=ssim_dr,
@@ -418,14 +404,18 @@ def main():
         # Evaluate EMA weights if enabled
         if ema is not None:
             ema.apply_shadow(model)
-        test_metrics = run_validation(
+        test_metrics, (x_test, y_test, pred_test) = run_validation(
             model=model,
             loader=test_loader,
             device=device,
+            cfg=cfg,
             include_psnr=cfg.metrics.compute_psnr,
             include_ssim=cfg.metrics.compute_ssim,
-            data_range=ssim_dr,
+            data_range=ssim_dr
+
         )
+
+        _maybe_log_triplets(global_step, x_test, pred_test, y_test, model="test")
         if ema is not None:
             ema.restore(model)
 
@@ -472,10 +462,11 @@ def main():
     get_logger().info("Running final validation on held-out set...")
     if ema is not None:
         ema.apply_shadow(model)
-    val_metrics = run_validation(
+    val_metrics, _ = run_validation(
         model=model,
         loader=val_loader,
         device=device,
+        cfg=cfg,
         include_psnr=cfg.metrics.compute_psnr,
         include_ssim=cfg.metrics.compute_ssim,
         data_range=ssim_dr,

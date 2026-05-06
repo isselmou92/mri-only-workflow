@@ -30,6 +30,8 @@ class DataCfg:
     mri_glob: str = "**/*.nii*"
     ct_glob: str = "**/*.nii*"
 
+    fold: int = 0  # fold number for cross-validation (added in default.yaml)``
+
     # Pairing policy
     pairing: PairingCfg = field(default_factory=PairingCfg)
 
@@ -71,6 +73,9 @@ class TrainCfg:
     grad_accum_steps: int = 1
     ema: bool = False
     device_preference: str = "cuda"  # "cuda" | "cpu" | "auto"
+    continue_from_checkpoint: Optional[str] = None  # path to .ckpt to resume training
+    crop_prob: float = 0.5                      # prob of cropping vs center-cropping (for data augmentation)
+    flip_prob: float = 0.5                       # prob of random horizontal flip (LR) for data augmentation
 
     # XAI during training
     xai_enabled: bool = True
