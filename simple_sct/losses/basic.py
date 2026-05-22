@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .nmi import NMILoss
+
 
 def gaussian_kernel_3d(kernel_size: int, sigma: float, device=None, dtype=None) -> torch.Tensor:
     coords = torch.arange(kernel_size, device=device, dtype=dtype) - (kernel_size - 1) / 2.0
@@ -12,15 +12,17 @@ def gaussian_kernel_3d(kernel_size: int, sigma: float, device=None, dtype=None) 
     g3 = g1[:, None, None] * g1[None, :, None] * g1[None, None, :]
     return g3
 
+
 class L1(nn.Module):
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return torch.mean(torch.abs(pred - target))
+
 
 class SSIM3D(nn.Module):
     """
     3D SSIM as a loss (L = 1 - SSIM).
 
-    For numerical stability the inputs are **normalised to [0, 1]** inside
+    For numerical stability the inputs are normalised to [0, 1] inside
     ``forward()`` using ``data_range`` before any statistics are computed.
     This avoids float32 precision loss that otherwise occurs when computing
     ``E[x^2] - (E[x])^2`` on large-valued HU volumes (magnitudes ~ 10^3-10^4).
@@ -30,6 +32,7 @@ class SSIM3D(nn.Module):
                     Used to rescale inputs to [0, 1] internally.
                     Default 1.0 keeps the original behaviour for [0, 1] data.
     """
+
     def __init__(self, kernel_size: int = 7, sigma: float = 1.5, data_range: float = 1.0):
         super().__init__()
         assert kernel_size % 2 == 1, "kernel_size should be odd for symmetric padding"
@@ -43,12 +46,12 @@ class SSIM3D(nn.Module):
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         assert x.shape == y.shape, f"SSIM3D expects same shape, got {x.shape} vs {y.shape}"
 
-        # --- float32 for safety under AMP ---
+        # float32 for safety under AMP
         dev = x.device
         x32 = x.to(dtype=torch.float32, device=dev)
         y32 = y.to(dtype=torch.float32, device=dev)
 
-        # --- normalise to ~[0, 1] so intermediate values stay O(1) ---
+        # Normalise to ~[0, 1] so intermediate values stay O(1)
         if self.data_range != 1.0:
             lo = torch.minimum(x32.min(), y32.min()).detach()
             x32 = (x32 - lo) / self.data_range
@@ -62,7 +65,7 @@ class SSIM3D(nn.Module):
         def conv(z: torch.Tensor) -> torch.Tensor:
             zc = []
             for c in range(C):
-                zc.append(F.conv3d(z[:, c:c+1], g, padding=pad))
+                zc.append(F.conv3d(z[:, c:c + 1], g, padding=pad))
             return torch.cat(zc, dim=1)
 
         mu_x = conv(x32)
@@ -75,7 +78,7 @@ class SSIM3D(nn.Module):
         sig_y2 = conv(y32 * y32) - mu_y2
         sig_xy = conv(x32 * y32) - mu_xy
 
-        # Clamp variances to 0 (can go slightly negative from float arithmetic)
+        # Variances can go slightly negative from float arithmetic
         sig_x2 = sig_x2.clamp(min=0.0)
         sig_y2 = sig_y2.clamp(min=0.0)
 
@@ -86,52 +89,37 @@ class SSIM3D(nn.Module):
         ssim_map = (num / (den + 1e-8)).clamp(-1.0, 1.0)
         return 1.0 - ssim_map.mean()
 
-class CompositeLoss(nn.Module):
-    def __init__(self, l1_weight: float = 1.0, ssim_weight: float = 0.0,
-                 ssim_kernel: int = 7, ssim_sigma: float = 1.5,
-                 ssim_data_range: float = 1.0):
-        super().__init__()
-        self.w_l1 = float(l1_weight)
-        self.w_ssim = float(ssim_weight)
-        self.l1 = L1()
-        self.ssim = SSIM3D(kernel_size=int(ssim_kernel), sigma=float(ssim_sigma),
-                           data_range=float(ssim_data_range)) if self.w_ssim > 0 else None
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        loss = 0.0
-        if self.w_l1 > 0:
-            loss = loss + self.w_l1 * self.l1(pred, target)
-        if self.ssim is not None:
-            # SSIM internally computes in fp32; safe under AMP
-            loss = loss + self.w_ssim * self.ssim(pred, target)
-        return loss
 
 class ReconstructionLoss(nn.Module):
-    def __init__(self, l1_weight=1.0, ssim_weight=0.0,
-                 ssim_kernel=7, ssim_sigma=1.5, ssim_data_range=1.0,
-                 nmi_weight=0.0, nmi_bins=64,
-                 nmi_value_min=-1.0, nmi_value_max=1.0, nmi_sigma=None):
+    """Weighted sum of L1 and 3D SSIM. Either weight can be zero to disable
+    that term, but at least one must be positive."""
+
+    def __init__(
+        self,
+        l1_weight: float = 1.0,
+        ssim_weight: float = 0.0,
+        ssim_kernel: int = 7,
+        ssim_sigma: float = 1.5,
+        ssim_data_range: float = 1.0,
+    ):
         super().__init__()
         self.w_l1 = float(l1_weight)
         self.w_ssim = float(ssim_weight)
-        self.w_nmi = float(nmi_weight)
-
-        self.l1 = L1()
-        self.ssim = SSIM3D(kernel_size=int(ssim_kernel), sigma=float(ssim_sigma),
-                           data_range=float(ssim_data_range)) if self.w_ssim > 0 else None
-        self.nmi = NMILoss(
-            bins=int(nmi_bins),
-            value_min=float(nmi_value_min),
-            value_max=float(nmi_value_max),
-            sigma=nmi_sigma
-        ) if self.w_nmi > 0 else None
+        if self.w_l1 <= 0.0 and self.w_ssim <= 0.0:
+            raise ValueError("ReconstructionLoss requires at least one of l1_weight, ssim_weight > 0")
+        self.l1 = L1() if self.w_l1 > 0 else None
+        self.ssim = SSIM3D(
+            kernel_size=int(ssim_kernel),
+            sigma=float(ssim_sigma),
+            data_range=float(ssim_data_range),
+        ) if self.w_ssim > 0 else None
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        loss = 0.0
-        if self.w_l1 > 0:
+        # Initialise to a tensor on the right device/dtype so the result is
+        # always a torch.Tensor (with grad), even if one weight is zero.
+        loss = torch.zeros((), device=pred.device, dtype=pred.dtype)
+        if self.l1 is not None:
             loss = loss + self.w_l1 * self.l1(pred, target)
         if self.ssim is not None:
             loss = loss + self.w_ssim * self.ssim(pred, target)
-        if self.nmi is not None:
-            loss = loss + self.w_nmi * self.nmi(pred, target)
         return loss

@@ -1,0 +1,126 @@
+# configs/default.yaml
+# Minimal 3D sCT config (whole-volume training).
+# Volumes: 128 x 128 x 112 (D x H x W), MRI -> CT (HU)
+# Pairing: MR file under <mri_dir>, CT file at the matching path under <ct_dir>
+# (filename convention: replace "MR" with "CT" in the stem).
+
+experiment_name: "end_run_22_05_2026"
+seed: 1337
+
+data:
+  # --- Directories containing resampled NIfTI volumes ---
+  # Paths are resolved relative to this YAML file.
+  mri_dir: "C:\\Users\\Isselmou\\PycharmProjects\\mri-only-workflow\\dataset\\MR"
+  ct_dir:  "C:\\Users\\Isselmou\\PycharmProjects\\mri-only-workflow\\dataset\\CT"
+
+  # --- External held-out test cohort (never touched by CV) ---
+  # Consumed only by scripts/ensemble_test.py.
+  test_mri_dir: "C:\\Users\\Isselmou\\PycharmProjects\\mri-only-workflow\\dataset\\Test_Data\\MR"
+  test_ct_dir:  "C:\\Users\\Isselmou\\PycharmProjects\\mri-only-workflow\\dataset\\Test_Data\\CT"
+
+  # Mouse IDs that physically live in ../dataset/MR but belong to the
+  # external test cohort. The dataset filters these out at construction so
+  # they can never leak into training/CV. Keep this list in lock-step with
+  # ../dataset/Test_Data/ and with configs/test_strain_map.json.
+  #   MZEI00027 / MZEI00031 -> BALB/c (within-strain test)
+  #   MZEI00066 / MZEI00069 -> C57BL/6 (inter-strain test)
+  exclude_mouse_ids:
+    - "MZEI00027"
+    - "MZEI00031"
+    - "MZEI00066"
+    - "MZEI00069"
+
+  # Cap on acquisitions per mouse applied only when constructing the test
+  # cohort (via scripts/ensemble_test.py). 3 yields a symmetric test set:
+  #   BALB/c:   MZEI00027 (3) + MZEI00031 (3) -> 6 acquisitions
+  #   C57BL/6:  MZEI00066 (4->3) + MZEI00069 (10->3) -> 6 acquisitions
+  # Set to null to keep every acquisition that exists on disk.
+  test_max_acquisitions_per_mouse: 3
+
+  # 3-fold cross-validation: 0, 1, or 2. Each fold holds out a disjoint
+  # set of mouse IDs as the validation set. Outputs auto-suffix with _fold{N}.
+  fold: 0
+
+  enforce_shape: [ 128, 128, 112 ]    # (D,H,W) - all data must match this
+  reorient_to_canonical: false
+
+  # Scaling: keep targets in HU for interpretable metrics (MAE/RMSE in HU)
+  scale_input: "zscore"          # "zscore" | "minmax" | "none"
+  scale_target: "minmax"         # "hu" | "minmax"
+  hu_min: -1000.0
+  hu_max:  3000.0
+
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: true
+
+train:
+  epochs: 500
+  batch_size: 2
+  lr: 1.5e-4
+  weight_decay: 0.0
+  amp: true                        # mixed precision
+  grad_clip: 1.0
+  grad_accum_steps: 1
+  ema: true
+  device_preference: "cuda"        # "cuda" | "cpu" | "auto"
+  continue_from_checkpoint: null
+  crop_prob: 0.5                   # random translation crop
+  flip_prob: 0.5                   # anatomical L/R flip
+
+  xai_cmap: "redblue"
+
+  # ---- XAI logged during training ----
+  xai_enabled: true
+  xai_log_every_steps: 200
+  xai_methods: [ "saliency" ]      # ["saliency"] or ["saliency", "occlusion"]
+  xai_occlusion:
+    patch: [ 9, 9, 9 ]
+    stride: [ 8, 8, 8 ]
+  xai_log_norm: true
+  xai_log_axes: [ "axial", "sagittal", "coronal" ]
+  xai_slice_indices:
+    axial: [ 64 ]
+    sagittal: [ 64 ]
+    coronal: [ 56 ]
+
+model:
+  in_channels: 1
+  out_channels: 1
+  base_filters: 32
+  depth: 3
+  final_act: "tanh"                # tanh bounds output to [-1, 1], matching scale_target="minmax"
+
+# L1 + SSIM only. Set one of the weights to 0 to isolate either term;
+# scripts/run_sweep.py overrides these per loss preset.
+loss:
+  l1_weight: 1.0
+  ssim_weight: 0.0
+  ssim_kernel: 7
+  ssim_sigma: 1.5
+
+metrics:
+  compute_psnr: true
+  compute_ssim: true
+
+logging:
+  log_interval: 10
+  tensorboard: true
+  checkpoint_every: 20             # epochs
+  save_best_on: "val_mae"          # minimize
+  out_dir: "output"
+  log_dir: "runs"
+  ckpt_dir: "checkpoints"
+
+  tb_images_every_steps: 100
+  tb_render_axes: [ "axial", "sagittal", "coronal" ]
+  tb_slice_indices:
+    axial: [ 64 ]
+    sagittal: [ 64 ]
+    coronal: [ 56 ]
+
+  # Predicted-volume images on the held-out CV val fold.
+  # Log triplets (MRI / pred / CT) for the first N val samples every K epochs.
+  # Set tb_log_val_images_every_epochs to 0 to disable.
+  tb_log_val_images_every_epochs: 1
+  tb_val_max_samples: 1

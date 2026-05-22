@@ -5,7 +5,7 @@ A PyTorch-based pipeline for generating **synthetic CT (sCT)** from MRI using a 
 ## Features
 
 - **3D U-Net** with configurable depth, InstanceNorm, LeakyReLU, and residual connections
-- **Composite loss** (L1 + 3D SSIM + optional NMI)
+- **Reconstruction loss** (weighted sum of L1 and 3D SSIM)
 - **Mixed-precision training** (AMP) with EMA and cosine annealing
 - **Explainable AI**: gradient saliency, SmoothGrad, Grad-CAM, occlusion sensitivity
 - **End-to-end pipeline**: NIfTI inference, DICOM export (HFS/RayStation) for sCT, GT, and MR
@@ -23,8 +23,7 @@ mri-only-workflow/
 │   ├── data/
 │   │   └── volume_dataset.py     # NIfTI volume pair dataset
 │   ├── losses/
-│   │   ├── basic.py              # L1, SSIM3D, CompositeLoss
-│   │   └── nmi.py                # Differentiable NMI loss
+│   │   └── basic.py              # L1, SSIM3D, ReconstructionLoss
 │   ├── metrics/
 │   │   └── metrics.py            # MAE, RMSE, PSNR, SSIM
 │   ├── models/
@@ -170,7 +169,7 @@ All training, model, data, loss, and logging parameters are controlled via YAML.
 | `data` | Input/output directories, volume shape, scaling mode |
 | `train` | Epochs, batch size, LR, AMP, EMA, XAI settings |
 | `model` | U-Net architecture (channels, depth, activation) |
-| `loss` | L1/SSIM/NMI weights and parameters |
+| `loss` | L1 and SSIM weights and parameters |
 | `metrics` | Which metrics to compute (PSNR, SSIM) |
 | `logging` | TensorBoard, checkpointing, image logging frequency |
 

@@ -21,5 +21,5 @@ __version__ = "0.1.0"
 # Re-export common entry points for convenience
 from .config import CFG, load_config, choose_device  # noqa: F401
 from .models.simple_unet3d import UNet3D            # noqa: F401
-from .losses.basic import CompositeLoss             # noqa: F401
+from .losses.basic import ReconstructionLoss        # noqa: F401
 from .metrics.metrics import compute_all            # noqa: F401

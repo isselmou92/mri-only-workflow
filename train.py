@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import time
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 from torch.utils.data import DataLoader
@@ -20,12 +20,23 @@ from simple_sct.utils.logging import (
     log_triplet_panels,
     log_xai_maps,
 )
-from simple_sct.data.volume_dataset import VolumePairs
+from simple_sct.data.volume_dataset import VolumePairs, unnormalize
 from simple_sct.models.simple_unet3d import UNet3D
 # >>> changed here: use your new ReconstructionLoss
 from simple_sct.losses.basic import ReconstructionLoss
 from simple_sct.metrics.metrics import compute_all
 from simple_sct.xai.attribution import gradient_saliency, occlusion_sensitivity
+
+
+def _to_hu(t: torch.Tensor, hu_min: float, hu_max: float, scale_target: str) -> torch.Tensor:
+    """Map a tensor back to HU so metrics are interpretable.
+
+    For ``scale_target='minmax'`` the tensor lives in [-1, 1]; we invert that.
+    For ``scale_target='hu'`` it is already in HU and passes through.
+    """
+    if scale_target == "hu":
+        return t
+    return unnormalize(t, hu_min, hu_max)
 
 
 # -----------------------------
@@ -68,60 +79,92 @@ class EMA:
 # -----------------------------
 # Train/Val/Test Split by Mouse ID and Timepoint
 # -----------------------------
-def split_by_mouse_timepoint(ds: VolumePairs, seed: int = 1337) -> tuple[list[int], list[int], list[int]]:
+def _extract_mouse_id(stem: str) -> str:
     """
-    Split dataset into train/val/test.
-    
-    Val set (held out): Mouse 66 T1,T2 + Mouse 30 T1,T2,T3 (5 samples)
-    Train/Test: Remaining samples split 80/20
-    
+    Pull the mouse identifier from a NIfTI filename stem.
+
+    Convention: the mouse ID is the leading underscore-separated token,
+    e.g. 'MZEI00066_MR_HEAD_T1' -> 'MZEI00066'.
+    """
+    return stem.split("_", 1)[0].upper()
+
+
+def _sample_filename_stems(ds: VolumePairs) -> list[str]:
+    """Return one filename stem per dataset sample, e.g. ``MZEI00018_MR_T1``.
+
+    Strips both the ``.nii.gz`` and ``.nii`` extensions by splitting on the
+    first dot in the filename (``.split(".")[0]``), matching the rule used
+    by ``_extract_mouse_id``.
+    """
+    return [Path(p).name.split(".")[0] for p in ds.files]
+
+
+def _partition_into_folds(items: list, k: int) -> list[list]:
+    """
+    Deterministically split a list into k contiguous, near-equal-sized folds.
+    Earlier folds receive the extra items when len(items) is not divisible by k.
+    """
+    n = len(items)
+    base, rem = divmod(n, k)
+    out: list[list] = []
+    start = 0
+    for i in range(k):
+        size = base + (1 if i < rem else 0)
+        out.append(items[start:start + size])
+        start += size
+    return out
+
+
+def split_kfold(
+    ds: VolumePairs,
+    fold: int,
+    seed: int = 1337,
+    k: int = 3,
+) -> tuple[list[int], list[int], list[list[str]]]:
+    """
+    Pure k-fold cross-validation grouped by mouse ID (subject-level CV).
+
+    Mouse IDs are extracted from the MRI filename stem (token before the first
+    underscore), sorted alphabetically, and partitioned into ``k`` disjoint
+    groups. Samples whose mouse belongs to ``fold_assignments[fold]`` form the
+    held-out validation set; samples from all other mice form the training set.
+
+    There is no additional train/test split: model selection (best checkpoint)
+    is done on the held-out val fold, and that same fold provides the reported
+    per-fold metric. Across the k runs, every mouse is held out exactly once,
+    which is the textbook k-fold CV property. The ``seed`` only affects the
+    deterministic shuffle of the training indices (for batch diversity); it
+    has no effect on which mouse lands in which fold.
+
     Returns:
-        (train_indices, val_indices, test_indices)
+        (train_indices, val_indices, fold_assignments)
+        where ``fold_assignments[i]`` is the sorted list of mouse IDs in fold i.
     """
     import random
-    
-    val_patterns = [
-        ("66", ["T1", "T2"]),
-        ("30", ["T1", "T2", "T3"]),
-    ]
-    
-    val_indices = []
-    remaining_indices = []
-    
-    for idx, pair in enumerate(ds.pairs):
-        # Use the actual MRI filename for matching (not pair_keys which may be indices)
-        filename = pair.mri.stem.upper()  # e.g., "MZEI00066_MR_HEAD_REGISTERED_T1"
-        
-        is_val = False
-        
-        # Check val patterns
-        for mouse_id, timepoints in val_patterns:
-            # Match mouse ID (handles both MZEI00066 and MZEI0066 formats)
-            if f"MZEI000{mouse_id}" in filename or f"MZEI00{mouse_id}" in filename:
-                for tp in timepoints:
-                    # Match timepoint at end of filename (e.g., _T1, _T2)
-                    if filename.endswith(f"_{tp}") or filename.endswith(tp):
-                        is_val = True
-                        break
-            if is_val:
-                break
-        
-        if is_val:
-            val_indices.append(idx)
-        else:
-            remaining_indices.append(idx)
-    
-    # Split remaining indices 80/20 into train/test
+
+    if not (0 <= fold < k):
+        raise ValueError(f"fold must be in [0, {k}); got {fold}")
+
+    sample_keys = _sample_filename_stems(ds)
+    sample_mouse: list[str] = [_extract_mouse_id(s) for s in sample_keys]
+    unique_mice: list[str] = sorted(set(sample_mouse))
+    if len(unique_mice) < k:
+        raise RuntimeError(
+            f"Cannot do {k}-fold CV with only {len(unique_mice)} unique mouse IDs"
+        )
+
+    fold_assignments = _partition_into_folds(unique_mice, k)
+    val_mice = set(fold_assignments[fold])
+
+    val_indices: list[int] = []
+    train_indices: list[int] = []
+    for idx, mouse_id in enumerate(sample_mouse):
+        (val_indices if mouse_id in val_mice else train_indices).append(idx)
+
     rng = random.Random(seed)
-    rng.shuffle(remaining_indices)
-    
-    n_remaining = len(remaining_indices)
-    n_train = int(0.8 * n_remaining)
-    
-    train_indices = remaining_indices[:n_train]
-    test_indices = remaining_indices[n_train:]
-    
-    return train_indices, val_indices, test_indices
+    rng.shuffle(train_indices)
+
+    return train_indices, val_indices, fold_assignments
 
 
 # -----------------------------
@@ -144,24 +187,77 @@ def run_validation(
     device: torch.device,
     include_psnr: bool,
     include_ssim: bool,
-    data_range: float = 8000.0,
+    hu_min: float,
+    hu_max: float,
+    scale_target: str,
+    *,
+    writer: Optional[Any] = None,
+    tb_tag_prefix: Optional[str] = None,
+    tb_global_step: Optional[int] = None,
+    tb_render_axes: Optional[Sequence[str]] = None,
+    tb_slice_indices: Optional[Dict[str, Sequence[int]]] = None,
+    tb_max_samples: int = 0,
 ) -> Dict[str, float]:
+    """
+    Run inference over a loader and aggregate metrics in HU.
+
+    Predictions/targets are first un-normalised to HU so MAE/RMSE are directly
+    interpretable. PSNR/SSIM use ``data_range = hu_max - hu_min``. Optionally
+    also logs MRI/pred/CT triplet panels for the first ``tb_max_samples``
+    samples under ``tb_tag_prefix/sample{i}`` (set ``tb_max_samples=0`` or
+    leave ``writer`` as None to skip image logging).
+    """
     model.eval()
+    hu_range = float(hu_max) - float(hu_min)
     agg = {"mae": 0.0, "rmse": 0.0}
     if include_psnr:
         agg["psnr"] = 0.0
     if include_ssim:
         agg["ssim"] = 0.0
 
+    log_imgs = (
+        writer is not None
+        and tb_max_samples > 0
+        and tb_tag_prefix is not None
+        and tb_global_step is not None
+        and tb_render_axes is not None
+        and tb_slice_indices is not None
+    )
+
     n = 0
+    logged = 0
     for batch in loader:
         x = batch["mri"].to(device)
         y = batch["ct"].to(device)
-        pred = model(x)
-        m = compute_all(pred, y, include_psnr, include_ssim, data_range=data_range)
+        with torch.no_grad():
+            pred = model(x)
+        pred_hu = _to_hu(pred.float(), hu_min, hu_max, scale_target)
+        y_hu = _to_hu(y.float(), hu_min, hu_max, scale_target)
+        m = compute_all(pred_hu, y_hu, include_psnr, include_ssim, data_range=hu_range)
         for k, v in m.items():
             agg[k] += float(v)
         n += 1
+
+        if log_imgs and logged < tb_max_samples:
+            # log_triplet_panels handles a single example at a time, so iterate
+            # over the batch dim and stop once we've hit the budget.
+            B = x.shape[0]
+            for b in range(B):
+                if logged >= tb_max_samples:
+                    break
+                log_triplet_panels(
+                    writer=writer,
+                    tag_prefix=f"{tb_tag_prefix}/sample{logged}",
+                    mri=x[b:b + 1].detach().cpu(),
+                    pred=pred[b:b + 1].detach().cpu(),
+                    ct=y[b:b + 1].detach().cpu(),
+                    axes=tb_render_axes,
+                    slice_indices=tb_slice_indices,
+                    global_step=tb_global_step,
+                    normalize_input=True,
+                    normalize_targets=True,
+                )
+                logged += 1
 
     for k in list(agg.keys()):
         agg[k] /= max(1, n)
@@ -178,21 +274,43 @@ def main():
     # Device selection (CUDA-first like your codebase)
     device = choose_device(args.device or cfg.train.device_preference)
 
+    # Auto-isolate per-fold artifacts so concurrent folds never overwrite each other.
+    fold = int(cfg.data.fold)
+    cfg.experiment_name = f"{cfg.experiment_name}_fold{fold}"
+    cfg.logging.out_dir = str(Path(cfg.logging.out_dir) / f"fold{fold}")
+
     logger = get_logger()
     out_dir, ckpt_dir, preds_dir, tb_dir = prepare_dirs(
         cfg.logging.out_dir, cfg.experiment_name, cfg.logging.tensorboard, cfg.logging.log_dir
     )
     writer = create_tb_writer(tb_dir)
 
-    # Data - split by mouse ID and timepoint
+    # Data - pure 3-fold cross-validation by mouse ID. The held-out val fold
+    # is the only evaluation set: it drives both per-epoch monitoring and
+    # final reporting (best.pt is selected on val_mae).
+    #
+    # Two VolumePairs instances are built: one with augmentation (train) and
+    # one without (val). They scan the same directory with the same exclusion
+    # list and the same cap, so their internal file lists are identical and
+    # the indices returned by split_kfold address both consistently. The
+    # assertion below makes that invariant explicit and crashes loudly if
+    # someone ever changes one constructor path without the other.
     ds = VolumePairs(cfg)
-    train_indices, val_indices, test_indices = split_by_mouse_timepoint(ds, seed=cfg.seed)
-    
+    ds_eval = VolumePairs(cfg)
+    ds_eval.augment = False
+    assert ds.files == ds_eval.files, (
+        "VolumePairs file lists diverged between train and val instances; "
+        "k-fold indices would no longer be aligned."
+    )
+
+    train_indices, val_indices, fold_assignments = split_kfold(
+        ds, fold=fold, seed=cfg.seed, k=3
+    )
+
     train_ds = torch.utils.data.Subset(ds, train_indices)
-    val_ds = torch.utils.data.Subset(ds, val_indices)
-    test_ds = torch.utils.data.Subset(ds, test_indices)
-    
-    n_train, n_val, n_test = len(train_ds), len(val_ds), len(test_ds)
+    val_ds = torch.utils.data.Subset(ds_eval, val_indices)
+
+    n_train, n_val = len(train_ds), len(val_ds)
 
     train_loader = DataLoader(
         train_ds,
@@ -205,13 +323,6 @@ def main():
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-    )
-    test_loader = DataLoader(
-        test_ds,
         batch_size=1,
         shuffle=False,
         num_workers=0,
@@ -232,14 +343,12 @@ def main():
         opt, T_max=cfg.train.epochs, eta_min=1e-6,
     )
 
-    # >>> build ReconstructionLoss fully from YAML (no hardcoding)
-    # Compute the SSIM data range from the target scaling:
-    #   - "hu"    targets stay in raw HU  → range = hu_max - hu_min
-    #   - "minmax" targets are in [-1,1]  → range = 2.0
-    if cfg.data.scale_target == "hu":
-        ssim_dr = float(cfg.data.hu_max) - float(cfg.data.hu_min)
-    else:
-        ssim_dr = 2.0
+    # SSIM data range follows the target scaling: HU targets keep their raw
+    # range, minmax targets live in [-1, 1]. The reconstruction loss runs in
+    # whatever space the target is in; metrics are always reported in HU below.
+    ssim_dr = (float(cfg.data.hu_max) - float(cfg.data.hu_min)
+               if cfg.data.scale_target == "hu" else 2.0)
+    hu_range = float(cfg.data.hu_max) - float(cfg.data.hu_min)
 
     loss_fn = ReconstructionLoss(
         l1_weight=cfg.loss.l1_weight,
@@ -247,26 +356,29 @@ def main():
         ssim_kernel=getattr(cfg.loss, "ssim_kernel", 7),
         ssim_sigma=getattr(cfg.loss, "ssim_sigma", 1.5),
         ssim_data_range=ssim_dr,
-        nmi_weight=getattr(cfg.loss, "nmi_weight", 0.0),
-        nmi_bins=getattr(cfg.loss, "nmi_bins", 64),
-        nmi_value_min=getattr(cfg.loss, "nmi_value_min", -1.0),
-        nmi_value_max=getattr(cfg.loss, "nmi_value_max", 1.0),
-        nmi_sigma=getattr(cfg.loss, "nmi_sigma", None),
     )
 
     ema = EMA(model, decay=0.999) if cfg.train.ema else None
 
-    # Training state
-    best_key = cfg.logging.save_best_on
-    best_val = float("inf")  # minimize
+    # Training state. Best checkpoint is selected on val_mae (lowest wins).
+    best_val = float("inf")
     global_step = 0
 
     logger.info(
-        f"Start training | epochs={cfg.train.epochs} | train={n_train} | val={n_val} | test={n_test} | "
-        f"device={device} | amp={cfg.train.amp}"
+        f"Start training | fold={fold}/3 | epochs={cfg.train.epochs} | "
+        f"train={n_train} | val={n_val} | device={device} | amp={cfg.train.amp}"
     )
-    logger.info(f"Val samples: {[ds.pairs[i].mri.stem for i in val_indices]}")
-    logger.info(f"Test samples: {[ds.pairs[i].mri.stem for i in test_indices]}")
+    excluded_mice = getattr(ds, "_excluded_mouse_ids", []) or []
+    excluded_n = getattr(ds, "_excluded_sample_count", 0)
+    if excluded_mice:
+        logger.info(
+            f"Excluded {excluded_n} sample(s) belonging to test mice: {excluded_mice}"
+        )
+    for i, mice in enumerate(fold_assignments):
+        marker = " (val)" if i == fold else ""
+        logger.info(f"  fold {i}{marker}: {mice}")
+    _all_keys = _sample_filename_stems(ds)
+    logger.info(f"Val samples: {[_all_keys[i] for i in val_indices]}")
 
     # --- XAI colormap (new): user wanted hot/cold
     xai_cmap = getattr(cfg.train, "xai_cmap", "hot")  # typical diverging map
@@ -368,6 +480,21 @@ def main():
 
             loss = loss_fn(pred_f32, y_f32) / max(1, cfg.train.grad_accum_steps)
 
+            # ---- Guard: a non-tensor loss has no autograd graph and can't be
+            # backpropagated. Skip the batch and log a (rate-limited) warning
+            # so we can still diagnose the underlying issue.
+            if not isinstance(loss, torch.Tensor):
+                if global_step % 50 == 0:
+                    get_logger().warning(
+                        f"loss_fn returned non-tensor "
+                        f"({type(loss).__name__}={loss!r}); skipping batch. "
+                        f"weights: l1={cfg.loss.l1_weight}, "
+                        f"ssim={cfg.loss.ssim_weight}"
+                    )
+                opt.zero_grad(set_to_none=True)
+                global_step += 1
+                continue
+
             # ---- Guard: skip batches that produce inf/nan loss ----
             if not torch.isfinite(loss):
                 opt.zero_grad(set_to_none=True)
@@ -400,11 +527,17 @@ def main():
                 # also log quick metrics on-the-fly for current batch (optional)
                 if writer is not None:
                     with torch.no_grad():
+                        pred_hu = _to_hu(
+                            pred_f32, cfg.data.hu_min, cfg.data.hu_max, cfg.data.scale_target
+                        )
+                        y_hu = _to_hu(
+                            y_f32, cfg.data.hu_min, cfg.data.hu_max, cfg.data.scale_target
+                        )
                         m = compute_all(
-                            pred_f32, y_f32,
+                            pred_hu, y_hu,
                             include_psnr=cfg.metrics.compute_psnr,
                             include_ssim=cfg.metrics.compute_ssim,
-                            data_range=ssim_dr,
+                            data_range=hu_range,
                         )
                         log_scalars(writer, m, global_step, prefix="train/batch_metrics")
                         msg += f" | MAE={m['mae']:.2f} HU"
@@ -414,24 +547,39 @@ def main():
             _maybe_log_triplets(global_step, x, pred, y)
             _maybe_log_xai(global_step, x, y)
 
-        # ---------------- Test ----------------
+        # ---------------- Validation (held-out CV fold) ----------------
         # Evaluate EMA weights if enabled
         if ema is not None:
             ema.apply_shadow(model)
-        test_metrics = run_validation(
+        # Decide once per epoch whether to log val predicted volumes to TB.
+        _val_imgs_every = int(getattr(cfg.logging, "tb_log_val_images_every_epochs", 1))
+        _log_val_imgs = (
+            writer is not None
+            and _val_imgs_every > 0
+            and (epoch % _val_imgs_every == 0)
+        )
+        val_metrics = run_validation(
             model=model,
-            loader=test_loader,
+            loader=val_loader,
             device=device,
             include_psnr=cfg.metrics.compute_psnr,
             include_ssim=cfg.metrics.compute_ssim,
-            data_range=ssim_dr,
+            hu_min=cfg.data.hu_min,
+            hu_max=cfg.data.hu_max,
+            scale_target=cfg.data.scale_target,
+            writer=writer if _log_val_imgs else None,
+            tb_tag_prefix="val/volumes" if _log_val_imgs else None,
+            tb_global_step=epoch if _log_val_imgs else None,
+            tb_render_axes=cfg.logging.tb_render_axes,
+            tb_slice_indices=cfg.logging.tb_slice_indices.__dict__,
+            tb_max_samples=int(getattr(cfg.logging, "tb_val_max_samples", 1)) if _log_val_imgs else 0,
         )
         if ema is not None:
             ema.restore(model)
 
-        # TensorBoard: epoch metrics for test
+        # TensorBoard: epoch metrics for val
         if writer is not None:
-            log_scalars(writer, test_metrics, epoch, prefix="test")
+            log_scalars(writer, val_metrics, epoch, prefix="val")
 
         # Step the LR scheduler once per epoch
         scheduler.step()
@@ -439,63 +587,58 @@ def main():
 
         took = time.time() - t0
         avg_epoch_loss = running / max(1, n_valid_steps)
-        test_str = " | ".join([f"test_{k}={v:.4f}" if k != "mae" else f"test_mae={v:.2f} HU" for k, v in test_metrics.items()])
+        def _fmt_val(k: str, v: float) -> str:
+            if k in ("mae", "rmse"):
+                return f"val_{k}={v:.2f} HU"
+            return f"val_{k}={v:.4f}"
+        val_str = " | ".join(_fmt_val(k, v) for k, v in val_metrics.items())
         get_logger().info(
             f"[Epoch {epoch}] train_loss={avg_epoch_loss:.4f} | "
-            + test_str
+            + val_str
             + f" | lr={current_lr:.2e} | {took:.1f}s"
         )
         if writer is not None:
             log_scalars(writer, {"lr": current_lr}, epoch, prefix="train")
 
-        # Save checkpoints
+        # Save checkpoints: keep only the latest and the best (by val MAE).
+        # Pure k-fold CV: the held-out val fold is the *only* evaluation set,
+        # so best.pt is the result we report for this fold.
         ckpt_payload = {
             "model": model.state_dict(),
             "epoch": epoch,
-            "test": test_metrics,
+            "val": val_metrics,
             "optimizer": opt.state_dict(),
             "scheduler": scheduler.state_dict(),
         }
-        if epoch % cfg.logging.checkpoint_every == 0:
-            path = Path(ckpt_dir) / f"epoch_{epoch:04d}.pt"
-            torch.save(ckpt_payload, path)
+        latest_path = Path(ckpt_dir) / "latest.pt"
+        torch.save(ckpt_payload, latest_path)
 
-        # Save best (minimize test_mae)
-        current = test_metrics.get("mae", None)
+        # Save best (minimize val_mae)
+        current = val_metrics.get("mae", None)
         if current is not None and current < best_val:
             best_val = current
-            path = Path(ckpt_dir) / "best.pt"
-            torch.save(ckpt_payload, path)
-            get_logger().info(f"Saved new best checkpoint @ epoch {epoch} (test_mae={current:.4f})")
+            best_path = Path(ckpt_dir) / "best.pt"
+            torch.save(ckpt_payload, best_path)
+            get_logger().info(f"Saved new best checkpoint @ epoch {epoch} (val_mae={current:.4f})")
 
-    # ---------------- Final Validation (held-out set) ----------------
-    get_logger().info("Running final validation on held-out set...")
-    if ema is not None:
-        ema.apply_shadow(model)
-    val_metrics = run_validation(
-        model=model,
-        loader=val_loader,
-        device=device,
-        include_psnr=cfg.metrics.compute_psnr,
-        include_ssim=cfg.metrics.compute_ssim,
-        data_range=ssim_dr,
-    )
-    if ema is not None:
-        ema.restore(model)
-    
-    # Log final val metrics to TensorBoard
+    # ---------------- Done ----------------
+    # In pure k-fold CV, the held-out val fold is evaluated every epoch and
+    # best.pt already holds the weights with the lowest val_mae for this fold.
+    # No separate final-evaluation pass is needed.
+    if best_val < float("inf"):
+        get_logger().info(
+            f"Training complete. Best val_mae for fold {fold}: {best_val:.4f} "
+            f"(checkpoint: {Path(ckpt_dir) / 'best.pt'})"
+        )
+    else:
+        get_logger().info("Training complete. No best checkpoint was saved (val_mae never finite?).")
+
+    # Flush and close the TB writer so all events land on disk before the
+    # process exits. Important when the sweep launcher runs many of these
+    # concurrently and tears them down close together.
     if writer is not None:
-        log_scalars(writer, val_metrics, cfg.train.epochs, prefix="val_final")
-    
-    val_str = " | ".join([f"val_{k}={v:.4f}" if k != "mae" else f"val_mae={v:.2f} HU" for k, v in val_metrics.items()])
-    get_logger().info(f"[Final Validation] {val_str}")
-    
-    # Save final checkpoint with val metrics
-    path = Path(ckpt_dir) / "final.pt"
-    torch.save({"model": model.state_dict(), "epoch": cfg.train.epochs, "val": val_metrics, "test": test_metrics}, path)
-    get_logger().info(f"Saved final checkpoint to {path}")
-    
-    get_logger().info("Training complete.")
+        writer.flush()
+        writer.close()
 
 
 if __name__ == "__main__":
