@@ -1,0 +1,110 @@
+# Ablation of configs/aug_full.yaml without N4: identical except that the
+# original (uncorrected) MRIs are used for training and testing.
+#
+#   python scripts/run_sweep.py --base-config configs/aug_noN4.yaml --losses ssim \
+#       --out output/aug_noN4 --gpus 0 --per-gpu 3 --num-workers 6
+experiment_name: sct_aug_noN4
+seed: 1337
+data:
+  mri_dir: ../dataset/MR
+  ct_dir: ../dataset/CT
+  test_mri_dir: ../dataset/Test_Data/MR
+  test_ct_dir: ../dataset/Test_Data/CT
+  exclude_mouse_ids:
+  - MZEI00027
+  - MZEI00031
+  - MZEI00066
+  - MZEI00069
+  exclude_sample_keys:
+  - MZEI00029_MR_T1
+  test_max_acquisitions_per_mouse: 3
+  fold: 0
+  enforce_shape:
+  - 128
+  - 128
+  - 112
+  reorient_to_canonical: false
+  scale_input: fg_percentile
+  fg_percentiles:
+  - 0.5
+  - 99.5
+  scale_target: minmax
+  hu_min: -1000.0
+  hu_max: 3000.0
+  num_workers: 6
+  prefetch_factor: 2
+  pin_memory: true
+train:
+  epochs: 500
+  batch_size: 2
+  lr: 0.00015
+  weight_decay: 0.0
+  amp: true
+  grad_clip: 1.0
+  grad_accum_steps: 1
+  ema: true
+  device_preference: cuda
+  continue_from_checkpoint: null
+  crop_prob: 0.5
+  flip_prob: 0.5
+  intensity_aug: true
+  aug_prob: 0.8
+  aug_bias_prob: 0.5
+  aug_bias_max_log: 1.0
+  aug_bias_grid: 4
+  aug_gamma_prob: 0.5
+  aug_gamma_range:
+  - 0.5
+  - 2.0
+  aug_curve_prob: 0.5
+  aug_curve_knots: 5
+  aug_curve_jitter: 0.15
+  aug_blur_prob: 0.15
+  aug_blur_sigma:
+  - 0.25
+  - 1.0
+  aug_sharpen_prob: 0.15
+  aug_sharpen_amount:
+  - 0.3
+  - 1.0
+  aug_noise_prob: 0.3
+  aug_noise_std:
+  - 0.0
+  - 0.05
+  xai_enabled: false
+model:
+  in_channels: 1
+  out_channels: 1
+  base_filters: 32
+  depth: 3
+  final_act: tanh
+loss:
+  l1_weight: 0.0
+  ssim_weight: 1.0
+  ssim_kernel: 7
+  ssim_sigma: 1.5
+metrics:
+  compute_psnr: true
+  compute_ssim: true
+logging:
+  log_interval: 10
+  tensorboard: true
+  checkpoint_every: 20
+  save_best_on: val_mae
+  out_dir: ../output/aug_noN4
+  log_dir: ../output/aug_noN4/tb
+  ckpt_dir: checkpoints
+  tb_images_every_steps: 500
+  tb_render_axes:
+  - axial
+  - sagittal
+  - coronal
+  tb_slice_indices:
+    axial:
+    - 64
+    sagittal:
+    - 64
+    coronal:
+    - 56
+  tb_log_val_images_every_epochs: 5
+  tb_val_max_samples: 1

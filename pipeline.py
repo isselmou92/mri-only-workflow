@@ -241,6 +241,9 @@ def scale_input(x: np.ndarray, mode: str) -> np.ndarray:
         xmax = float(x.max()) + 1e-8
         u = (x - xmin) / (xmax - xmin)
         return u * 2.0 - 1.0
+    if mode == "fg_percentile":
+        from simple_sct.data.intensity import fg_percentile_normalize
+        return fg_percentile_normalize(x)
     if mode == "none":
         return x.astype(np.float32)
     raise ValueError(f"Unknown scale_input: {mode}")
