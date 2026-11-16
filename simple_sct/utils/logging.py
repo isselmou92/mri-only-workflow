@@ -11,6 +11,7 @@ import torch.nn.functional as F
 try:
     from torch.utils.tensorboard import SummaryWriter  # type: ignore
 except Exception:  # pragma: no cover
+    print("""WARNING: TensorBoard is not available. Install torch with 'pip install torch[tensorboard]' to enable TB logging.""")
     SummaryWriter = None  # type: ignore
 
 

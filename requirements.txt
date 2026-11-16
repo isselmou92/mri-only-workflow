@@ -5,6 +5,7 @@ pydicom
 pyyaml
 simpleitk
 scipy
+pandas
 pillow
 matplotlib
 tensorboard

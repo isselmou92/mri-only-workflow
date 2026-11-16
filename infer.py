@@ -18,6 +18,7 @@ except Exception:
     sitk = None
 
 from simple_sct.config import load_config, choose_device
+from simple_sct.data.intensity import fg_percentile_normalize
 from simple_sct.models.simple_unet3d import UNet3D
 
 
@@ -80,6 +81,8 @@ def scale_input(x: np.ndarray, mode: str) -> np.ndarray:
         xmin = float(x.min()); xmax = float(x.max()) + 1e-8
         u = (x - xmin) / (xmax - xmin)
         return u * 2.0 - 1.0
+    if mode == "fg_percentile":
+        return fg_percentile_normalize(x)
     if mode == "none":
         return x.astype(np.float32)
     raise ValueError(f"Unknown scale_input: {mode}")

@@ -1,179 +1,199 @@
 # MRI-Only Workflow
 
-A PyTorch-based pipeline for generating **synthetic CT (sCT)** from MRI using a **3D U-Net**, designed for preclinical MRI-only radiotherapy workflows. Includes training, inference, DICOM export (sCT, GT, MR), explainable AI (XAI) visualization, and baseline evaluation tools.
+Synthetic CT (sCT) generation from ultra-high-field mouse brain MRI with a 3D U-Net, for
+MRI-only preclinical treatment planning (X-rays, protons and carbon ions). The repository
+contains the complete code for training, cross-validation, ensemble inference on the
+held-out test cohort, evaluation against micro-CT and a population-average CT baseline,
+and DICOM export for treatment planning (RayStation).
 
-## Features
+Two model variants are provided:
 
-- **3D U-Net** with configurable depth, InstanceNorm, LeakyReLU, and residual connections
-- **Composite loss** (L1 + 3D SSIM + optional NMI)
-- **Mixed-precision training** (AMP) with EMA and cosine annealing
-- **Explainable AI**: gradient saliency, SmoothGrad, Grad-CAM, occlusion sensitivity
-- **End-to-end pipeline**: NIfTI inference, DICOM export (HFS/RayStation) for sCT, GT, and MR
-- **Evaluation**: bone Dice scores with rigid alignment (SimpleITK), publication-quality figures
-- **YAML-based configuration** with typed dataclasses
+| Variant | Config | MR scaling | Augmentation |
+|---------|--------|------------|--------------|
+| Published model | `configs/default.yaml` | z-score | translation, left/right flip |
+| Intensity-augmented model (recommended) | `configs/aug_noN4.yaml` | foreground percentiles | as above + MR-specific intensity augmentation |
 
-## Project Structure
+`configs/aug_full.yaml` is the N4 ablation of the augmented model (trained and tested on
+N4 bias-corrected MRIs); it did not improve the results.
+
+## Method in brief
+
+- **Network**: 3D U-Net (32 base filters, depth 3, 256-channel bottleneck, residual
+  double-convolution blocks, InstanceNorm, LeakyReLU, `tanh` output).
+- **Input / target**: co-registered MR and micro-CT volumes of 128 x 128 x 112 voxels
+  (0.14 mm isotropic). CT is mapped linearly from [-1000, 3000] HU to [-1, 1];
+  predictions are converted back to HU and clamped to this range.
+- **Training**: SSIM loss (L1 used as comparison), AdamW, cosine learning rate, AMP, EMA,
+  500 epochs, subject-grouped 3-fold cross-validation.
+- **Intensity augmentation** (`simple_sct/data/intensity.py`, MR only): smooth multiplicative
+  bias fields, gamma and random monotonic intensity curves, blur / sharpening and Gaussian
+  noise, applied on top of translation and flipping.
+- **Test cohort**: K = 3 ensemble (one model per fold), predictions averaged in HU.
+  Intra-strain (BALB/c) and inter-strain (C57BL/6) test animals, three acquisitions each.
+- **Baseline**: population-average CT (sCT^avg) of the training CTs, rigidly registered
+  to each test subject.
+
+## Repository structure
 
 ```
 mri-only-workflow/
 ├── configs/
-│   └── default.yaml              # Training/model/data configuration
-├── simple_sct/                   # Core library
-│   ├── config.py                 # Typed YAML config with dataclasses
-│   ├── data/
-│   │   └── volume_dataset.py     # NIfTI volume pair dataset
-│   ├── losses/
-│   │   ├── basic.py              # L1, SSIM3D, CompositeLoss
-│   │   └── nmi.py                # Differentiable NMI loss
-│   ├── metrics/
-│   │   └── metrics.py            # MAE, RMSE, PSNR, SSIM
-│   ├── models/
-│   │   └── simple_unet3d.py      # 3D U-Net architecture
-│   ├── utils/
-│   │   ├── logging.py            # TensorBoard helpers, directory setup
-│   │   └── seed.py               # Reproducibility utilities
-│   └── xai/
-│       └── attribution.py        # Saliency, SmoothGrad, Grad-CAM, occlusion
-├── train.py                      # Model training script
-├── infer.py                      # Single-volume inference
-├── pipeline.py                   # Full MRI -> sCT -> DICOM (sCT, GT, MR)
-├── xai_figures.py                # Generate publication XAI figures
-├── evaluate_alignment.py         # Rigid alignment + bone Dice evaluation
-├── average_ct_baseline.py        # Average CT baseline generation + Dice
-├── requirements.txt
-└── LICENSE
+│   ├── default.yaml              # published model
+│   ├── aug_noN4.yaml             # intensity-augmented model
+│   ├── aug_full.yaml             # augmented model with N4 bias correction (ablation)
+│   └── test_strain_map.json      # mouse ID -> strain for the test cohort
+├── simple_sct/                   # core library
+│   ├── config.py                 # typed YAML config (dataclasses)
+│   ├── data/volume_dataset.py    # NIfTI pair dataset, folds, spatial augmentation
+│   ├── data/intensity.py         # MR normalisation, N4, intensity augmentation
+│   ├── losses/basic.py           # L1, 3D SSIM, reconstruction loss
+│   ├── metrics/metrics.py        # MAE, RMSE, PSNR, SSIM
+│   ├── metrics/fov.py            # micro-CT field-of-view mask
+│   ├── models/simple_unet3d.py   # 3D U-Net
+│   ├── utils/                    # logging, seeding
+│   └── xai/attribution.py        # saliency, SmoothGrad, Grad-CAM, occlusion
+├── train.py                      # train one model (one fold)
+├── infer.py                      # single-volume inference
+├── pipeline.py                   # MR -> sCT -> DICOM (sCT, GT, MR)
+├── average_ct_baseline.py        # average CT baseline
+├── evaluate_alignment.py         # rigid registration + bone Dice
+├── postprocess_sct.py            # optional sCT post-processing
+├── xai_figures.py                # XAI figures
+└── scripts/                      # sweeps, evaluation, analysis and figures
 ```
 
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/mri-only-workflow.git
+git clone https://github.com/isselmou92/mri-only-workflow.git
 cd mri-only-workflow
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Requirements
+Python 3.10+ and a CUDA GPU are recommended (one training run uses about 9 GB of VRAM at
+batch size 2). The code was run with Python 3.12, PyTorch 2.5 and SimpleITK 2.5.
 
-- Python 3.9+
-- PyTorch (with CUDA recommended)
-- See `requirements.txt` for full dependency list
+## Data
 
-## Data Preparation
-
-Organize your NIfTI volumes into MRI and CT directories:
+The imaging data are not part of this repository. The expected layout is
 
 ```
-data/
-├── MR/
-│   ├── subject001_MR_T1.nii.gz
-│   ├── subject002_MR_T1.nii.gz
-│   └── ...
-└── CT/
-    ├── subject001_CT_T1.nii.gz
-    ├── subject002_CT_T1.nii.gz
-    └── ...
+dataset/
+├── MR/          MZEI00018_MR_T1.nii.gz ...     training / cross-validation MRIs
+├── CT/          MZEI00018_CT_T1.nii.gz ...     co-registered micro-CTs
+└── Test_Data/
+    ├── MR/      MZEI00027_MR_T1.nii.gz ...     held-out test MRIs
+    └── CT/      MZEI00027_CT_T1.nii.gz ...
 ```
 
-All volumes must be co-registered and resampled to the same grid (configured via `enforce_shape` in the YAML config). Update `data.mri_dir` and `data.ct_dir` in `configs/default.yaml` to point to your data directories.
+MR and CT are paired by replacing `MR` with `CT` in the file name; the leading token is the
+mouse ID used for subject-grouped folds. All volumes must be co-registered and resampled to
+the same grid. Paths in the configs are relative to the YAML file. Mouse IDs of the test
+cohort are listed in `exclude_mouse_ids` so they never enter training.
 
-## Usage
+The micro-CTs were cropped and rotated during alignment to the MR; voxels outside the
+rotated crop box carry a constant fill value of -990 HU. `simple_sct/metrics/fov.py`
+derives the CT field of view from this fill, and `--fov-mask` / `scripts/evaluate_test_fov.py`
+restrict the evaluation to it.
 
-### Training
+## Training
+
+Cross-validation sweep (one run per loss and fold, distributed over the available GPUs):
 
 ```bash
-python train.py --config configs/default.yaml
+# published model: L1 and SSIM, folds 0-2
+python scripts/run_sweep.py --base-config configs/default.yaml --out output/loss_sweep_final_22
+
+# intensity-augmented model (SSIM)
+python scripts/run_sweep.py --base-config configs/aug_noN4.yaml --losses ssim --out output/aug_noN4
 ```
 
-Training supports mixed-precision (AMP), EMA, gradient clipping, cosine annealing LR, and live XAI logging to TensorBoard. Checkpoints are saved to the directory specified in the config.
+A single run can also be started directly with `python train.py --config <config.yaml>`
+(the fold is set by `data.fold`). For the N4 ablation, first write bias-corrected MRIs with
+`python scripts/precompute_n4.py dataset/MR dataset/Test_Data/MR`.
 
-Monitor training:
-```bash
-tensorboard --logdir runs/
-```
-
-### Single-Volume Inference
-
-```bash
-python infer.py \
-    --config configs/default.yaml \
-    --ckpt checkpoints/best.pt \
-    --mri data/MR/subject001_MR_T1.nii.gz \
-    --out output/subject001_sCT.nii.gz
-```
-
-### Full Pipeline (Inference + DICOM Export)
+## Evaluation
 
 ```bash
-python pipeline.py \
-    --config configs/default.yaml \
-    --ckpt checkpoints/best.pt \
-    --mr data/MR/subject001_MR_T1.nii.gz \
-    --gt data/CT/subject001_CT_T1.nii.gz \
-    --ref reference.dcm \
-    --out output/workflow_results
+SWEEP=output/aug_noN4
+
+# cross-validation metrics in HU per volume (add --fov-mask for the CT field of view)
+python scripts/evaluate_sweep.py --sweep-root $SWEEP --use best
+
+# loss comparison with bootstrap confidence intervals (L1 vs SSIM)
+python scripts/compare_losses.py --per-volume-csv output/loss_sweep_final_22/eval_per_volume_best.csv
+
+# K = 3 ensemble on the held-out test cohort, writes sCT NIfTIs and per-volume metrics
+python scripts/ensemble_test.py --sweep-root $SWEEP --loss ssim \
+    --test-mri-dir dataset/Test_Data/MR --out-dir $SWEEP/ensemble_test_ssim --save-volumes
+
+# bone Dice of sCT and rigidly aligned average CT on the test cohort
+python scripts/test_dice_table.py --sweep-root $SWEEP --avg-ct output/average_CT/average_ct.nii.gz
+
+# bone surface distances (MSD, HD95) per strain
+python scripts/strain_mm_analysis.py \
+    --baseline-sct-dir output/loss_sweep_final_22/ensemble_test_ssim/sct --aug-sct-dir $SWEEP/ensemble_test_ssim/sct
+
+# metrics over the whole volume and inside the CT field of view
+python scripts/evaluate_sweep.py --sweep-root $SWEEP --use best --fov-mask --out-csv $SWEEP/eval_per_volume_best_fov.csv
+python scripts/evaluate_test_fov.py --published-sct-dir output/loss_sweep_final_22/ensemble_test_ssim/sct \
+    --aug-sct-dir $SWEEP/ensemble_test_ssim/sct --out output/fov_eval
+python scripts/plot_fov_summary.py   # reads output/fov_eval/cv_{final_22,aug_noN4}_{whole,fov}.csv
 ```
 
-### XAI Figures
+The analysis scripts expect the ensemble sCTs of the published and the augmented model in
+`output/test_sct/<model>/` by default; pass the directories explicitly as above otherwise.
 
-Generate publication-quality saliency, SmoothGrad, and Grad-CAM figures:
+Complete reproductions:
+
+- `bash scripts/reproduce_paper.sh [SWEEP]`: cross-validation, test ensembles, bone Dice,
+  figures and a markdown report for the published model.
+- `bash scripts/evaluate_aug.sh [SWEEP] [BASELINE] [TEST_MRI_DIR]`: evaluates an augmented
+  sweep and compares it with the published model (`scripts/compare_runs.py`).
+
+Further analysis scripts:
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/predict_per_fold.py` | sCT of each ensemble member separately |
+| `scripts/aggregate_sweep.py` | validation metrics stored in the checkpoints |
+| `scripts/plot_training_curves.py` | training curves from TensorBoard logs |
+| `scripts/make_combined_dice_figure.py` | bone-overlay figure (MR, micro-CT, sCT, average CT) |
+| `scripts/visualize_surface_distance.py` | illustration of the surface-distance metrics |
+| `scripts/test_dice_mr_registration.py` | average CT registered to micro-CT vs. to MR |
+| `scripts/strain_morphometry.py`, `scripts/strain_pairwise.py` | skull morphometry BALB/c vs. C57BL/6 |
+| `scripts/mr_intensity_check.py`, `scripts/quickcheck_harmonize_test_mr.py` | MR intensity distribution across strains |
+| `scripts/plot_fov_mask.py`, `scripts/plot_fov_overlay.py`, `scripts/summarize_fov_cv.py` | CT field-of-view mask and summaries |
+
+## Inference and DICOM export
 
 ```bash
-python xai_figures.py \
-    --config configs/default.yaml \
-    --ckpt checkpoints/best.pt \
-    --out_dir output/xai_figures
+# single volume
+python infer.py --config configs/aug_noN4.yaml --ckpt <fold>/checkpoints/best.pt \
+    --mri dataset/Test_Data/MR/MZEI00031_MR_T1.nii.gz --out MZEI00031_MR_T1_sCT.nii.gz
+
+# MR -> sCT -> DICOM series (sCT, GT, MR) for one subject
+python pipeline.py --config configs/aug_noN4.yaml --ckpt <fold>/checkpoints/best.pt \
+    --mr <mr.nii.gz> --gt <ct.nii.gz> --ref reference.dcm --out output/workflow_results
+
+# DICOM series (GT, MR, ensemble sCT, aligned average CT) for one test subject
+python scripts/export_dicom.py --subject MZEI00031_MR_T1 --sct-dir $SWEEP/ensemble_test_ssim/sct \
+    --sct-description "Synthetic CT - intensity-augmented U-Net" \
+    --ref dataset/reference.dcm --out output/dicom_export
 ```
 
-### Average CT Baseline
+Use the config the checkpoint was trained with, since it defines the MR scaling.
 
-Compute an average CT from the training set as a naive baseline:
+## Average CT baseline
 
 ```bash
-# From a directory of co-registered CTs
-python average_ct_baseline.py \
-    --ct-dir data/CT \
-    --out output/average_ct \
-    --gt-dir data/validation/CT \
-    --gt-subjects subject001_CT_T1 subject002_CT_T1
-
-# With rigid alignment before averaging
-python average_ct_baseline.py \
-    --ct-dir data/CT \
-    --out output/average_ct_aligned \
-    --align
-
-# From YAML config (uses training split)
-python average_ct_baseline.py \
-    --config configs/default.yaml \
-    --out output/average_ct
+python average_ct_baseline.py --config configs/default.yaml --out output/average_ct
+python evaluate_alignment.py --avg-ct output/average_ct/average_ct.nii \
+    --gt-dir dataset/Test_Data/CT --gt-subjects MZEI00027_CT_T1 MZEI00031_CT_T1 \
+    --out output/aligned_dice_results --save-aligned
 ```
-
-### Rigid Alignment + Dice Evaluation
-
-Evaluate bone Dice scores between the average CT baseline and ground truth CTs with rigid registration:
-
-```bash
-python evaluate_alignment.py \
-    --avg-ct output/average_ct/average_ct.nii \
-    --gt-dir data/validation/CT \
-    --gt-subjects subject001_CT_T1 subject002_CT_T1 \
-    --out output/aligned_dice_results \
-    --save-aligned
-```
-
-## Configuration
-
-All training, model, data, loss, and logging parameters are controlled via YAML. See `configs/default.yaml` for the full specification. Key sections:
-
-| Section | Description |
-|---------|-------------|
-| `data` | Input/output directories, volume shape, scaling mode |
-| `train` | Epochs, batch size, LR, AMP, EMA, XAI settings |
-| `model` | U-Net architecture (channels, depth, activation) |
-| `loss` | L1/SSIM/NMI weights and parameters |
-| `metrics` | Which metrics to compute (PSNR, SSIM) |
-| `logging` | TensorBoard, checkpointing, image logging frequency |
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+MIT License, see [LICENSE](LICENSE).
