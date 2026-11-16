@@ -1,7 +1,7 @@
 # MRI-Only Workflow
 
 Synthetic CT (sCT) generation from ultra-high-field mouse brain MRI with a 3D U-Net, for
-MRI-only preclinical treatment planning (X-rays, protons and carbon ions). The repository
+MRI-only preclinical treatment planning. The repository
 contains the complete code for training, cross-validation, ensemble inference on the
 held-out test cohort, evaluation against micro-CT and a population-average CT baseline,
 and DICOM export for treatment planning (RayStation).
