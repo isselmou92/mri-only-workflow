@@ -185,6 +185,20 @@ python scripts/export_dicom.py --subject MZEI00031_MR_T1 --sct-dir $SWEEP/ensemb
 
 Use the config the checkpoint was trained with, since it defines the MR scaling.
 
+### Pretrained weights
+
+The three fold checkpoints of the intensity-augmented model are available in release
+[v1.0.0](https://github.com/isselmou92/mri-only-workflow/releases/tag/v1.0.0).
+Extract `aug_noN4_model.zip` in the repository root; it creates `output/aug_noN4/` with the
+per-fold configs and checkpoints, so the commands above work directly:
+
+```bash
+python scripts/ensemble_test.py --sweep-root output/aug_noN4 --loss ssim \
+    --test-mri-dir dataset/Test_Data/MR --out-dir output/test_sct/aug_noN4 --save-volumes
+```
+
+The model was trained on BALB/c mice and expects the original (not N4-corrected) MR.
+
 ## Average CT baseline
 
 ```bash
